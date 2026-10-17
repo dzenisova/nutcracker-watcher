@@ -1,0 +1,60 @@
+name: Nutcracker ticket watcher
+
+on:
+  schedule:
+    - cron: "7 */2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nutcracker-watcher
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install browser
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Watch for tickets
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET_SEATS: ${{ vars.TARGET_SEATS }}
+          ONLY_DATES: ${{ vars.ONLY_DATES }}
+          CHECK_EVERY_MINUTES: "3"
+          RUN_FOR_MINUTES: "330"
+        run: python monitor.py
+
+      - name: Save what the bot has seen
+        if: always()
+        run: |
+          [ -f state.json ] || exit 0
+          git config user.name "nutcracker-watcher"
+          git config user.email "nutcracker-watcher@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update watcher state"
+          git pull --rebase --autostash || true
+          git push
+
+      - name: Keep page snapshots for troubleshooting
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: debug/
+          retention-days: 5
+          if-no-files-found: ignore
