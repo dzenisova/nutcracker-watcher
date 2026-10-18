@@ -1,8 +1,9 @@
 {
  "heartbeat": "2026-10-18",
  "initialised": true,
- "last_check_human": "Sun 18 Oct 05:07",
+ "last_check_human": "Sun 18 Oct 16:09",
  "links": {
+  "friday 11 december 7.30pm": "https://www.rbo.org.uk/checkout/interstitial/74559",
   "friday 8 january 7.30pm": "https://www.rbo.org.uk/checkout/interstitial/74566",
   "saturday 2 january 1.30pm": "https://www.rbo.org.uk/checkout/interstitial/74549",
   "saturday 2 january 7.00pm": "https://www.rbo.org.uk/checkout/interstitial/74555",
@@ -19,7 +20,7 @@
  "performances": {
   "friday 11 december 7.30pm": {
    "label": "Friday 11 December, 7.30pm",
-   "link": null,
+   "link": "https://www.rbo.org.uk/checkout/interstitial/74559",
    "status": "sold_out",
    "text": "Friday 11 December, 7.30pm Sold out All tickets for this date are sold out. Conductor Jonathan Lo Cast for this performance The Sugar Plum Fairy Akane Takada The Prince Joseph Sissens Clara Leticia Stock Hans-Peter/The Nutcracker Taisuke Nakao Herr Drosselmeyer James Hay Orchestra Orchestra of the R"
   },
@@ -204,8 +205,12 @@
    "text": "Wednesday 9 December, 7.30pm Sold out All tickets for this date are sold out. Conductor Jonathan Lo Cast for this performance The Sugar Plum Fairy Fumi Kaneko The Prince Vadim Muntagirov Clara Ella Newton Severgnini Hans-Peter/The Nutcracker Daichi Ikarashi Herr Drosselmeyer Bennet Gartside Orchestr"
   }
  },
- "rotation": 3,
+ "rotation": 0,
  "seat_checks": {
+  "friday 11 december 7.30pm": {
+   "checked_at": "18 Oct 16:09",
+   "readable": false
+  },
   "friday 8 january 7.30pm": {
    "checked_at": "17 Oct 18:02",
    "readable": false
