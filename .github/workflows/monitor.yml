@@ -52,12 +52,20 @@ jobs:
           [ -f state.json ] || exit 0
           git config user.name "nutcracker-watcher"
           git config user.email "nutcracker-watcher@users.noreply.github.com"
-          git add state.json
-          [ -d snapshots ] && git add snapshots
-          git diff --cached --quiet && exit 0
-          git commit -m "Update watcher state"
+          keep="$RUNNER_TEMP/keep"; mkdir -p "$keep"
+          cp state.json "$keep/"
+          [ -d snapshots ] && cp -r snapshots "$keep/"
           for attempt in 1 2 3; do
-            git pull --rebase --autostash && git push && exit 0
+            # Start from the latest version on GitHub, then put this run's state on top
+            git fetch -q origin "${{ github.ref_name }}"
+            git reset -q --hard "origin/${{ github.ref_name }}"
+            cp "$keep/state.json" state.json
+            [ -d "$keep/snapshots" ] && mkdir -p snapshots && cp -rn "$keep/snapshots/." snapshots/ || true
+            git add state.json
+            [ -d snapshots ] && git add snapshots
+            git diff --cached --quiet && exit 0
+            git commit -q -m "Update watcher state"
+            git push -q origin "HEAD:${{ github.ref_name }}" && exit 0
             sleep 10
           done
           echo "Could not save state" && exit 1

@@ -1,0 +1,47 @@
+name: One-off page check (for troubleshooting)
+
+# Runs one check of every page, prints what it sees and saves page copies
+# to the snapshots folder. Sends no Telegram messages.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install browser
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Check every page once
+        env:
+          ONLY_DATES: ${{ vars.ONLY_DATES }}
+          PARIS_ONLY_DATES: ${{ vars.PARIS_ONLY_DATES }}
+          SEATMAPS_PER_CYCLE: "1"
+          PARIS_SEATMAPS_PER_CYCLE: "2"
+        run: python monitor.py --once
+      - name: Save page copies
+        if: always()
+        run: |
+          [ -d snapshots ] || exit 0
+          git config user.name "nutcracker-watcher"
+          git config user.email "nutcracker-watcher@users.noreply.github.com"
+          keep="$RUNNER_TEMP/keep"; mkdir -p "$keep"; cp -r snapshots "$keep/"
+          for attempt in 1 2 3; do
+            git fetch -q origin "${{ github.ref_name }}"
+            git reset -q --hard "origin/${{ github.ref_name }}"
+            mkdir -p snapshots && cp -rn "$keep/snapshots/." snapshots/ || true
+            git add snapshots
+            git diff --cached --quiet && exit 0
+            git commit -q -m "Save page copies"
+            git push -q origin "HEAD:${{ github.ref_name }}" && exit 0
+            sleep 10
+          done
