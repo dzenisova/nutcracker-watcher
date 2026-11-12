@@ -1200,11 +1200,33 @@ class SecutixError(RuntimeError):
     pass
 
 
-def _fetch_json(page, url: str):
-    res = page.evaluate(FETCH_JSON_JS, url)
-    if res.get("status") != 200 or "json" not in (res.get("type") or "").lower():
-        raise SecutixError(f"HTTP {res.get('status')} {(res.get('type') or '')[:30]} for {url.split('?')[0]}")
-    return json.loads(res["body"])
+_SKIP_HEADERS = {"cookie", "host", "content-length", "connection", "accept-encoding"}
+
+
+def _fetch_json(page, url: str, headers: dict | None = None):
+    """GET seat-map JSON the way the seat map itself does (same session and headers)."""
+    if headers is not None:
+        hdrs = {k: v for k, v in headers.items() if k.lower() not in _SKIP_HEADERS and not k.startswith(":")}
+        resp = page.context.request.get(url, headers=hdrs, timeout=30_000)
+        status, ctype, body = resp.status, resp.headers.get("content-type", ""), resp.text()
+    else:
+        res = page.evaluate(FETCH_JSON_JS, url)
+        status, ctype, body = res.get("status"), res.get("type") or "", res.get("body") or ""
+    if status != 200 or "json" not in ctype.lower():
+        raise SecutixError(f"HTTP {status} for {url.split('?')[0].rsplit('/', 2)[-2:]}: {body[:160]}")
+    return json.loads(body)
+
+
+def _open_seat_page(page, base: str, pid: str):
+    """Opens a performance's seat page and returns (config json, request headers) from the
+    seat map's own request for seatmap/config/svg."""
+    url = f"{base}/selection/event/seat?perfId={pid}&productId={PARIS_PRODUCT_ID}&lang=en"
+    with page.expect_response(lambda r: "/tnwr/v1/seatmap/config/svg?" in r.url, timeout=45_000) as info:
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    resp = info.value
+    if resp.status != 200:
+        raise SecutixError(f"seat page config HTTP {resp.status}")
+    return resp.json(), resp.request.all_headers()
 
 
 _SEAT_CACHE: dict = {"shop": {}, "resale": {}}   # in memory only (kept out of state.json)
@@ -1242,12 +1264,27 @@ def read_secutix(context, base: str, perfs: list[dict], cache: dict, resale: boo
             perfs = [p for p in perfs if out["calendar"].get(p["id"]) != "sold_out"]
 
         now = time.time()
+        headers = None          # copied from the seat map's own request once we've seen one
+        direct_ok = True        # can we ask for other dates' data without opening their pages?
         for perf in perfs:
             pid = perf["id"]
             entry = {"ok": False}
             try:
-                cfg = _fetch_json(page, f"{base}/tnwr/v1/seatmap/config/svg?productId={PARIS_PRODUCT_ID}"
-                                        f"&performanceId={pid}&{SECUTIX_QS}")
+                cfg = None
+                if headers is not None and direct_ok:
+                    try:
+                        cfg = _fetch_json(page, f"{base}/tnwr/v1/seatmap/config/svg?productId={PARIS_PRODUCT_ID}"
+                                                f"&performanceId={pid}&{SECUTIX_QS}", headers)
+                    except SecutixError as exc:
+                        log(f"Direct seat-map request refused ({exc}); opening each seat page instead")
+                        direct_ok = False
+                opened_here = False
+                if cfg is None:
+                    cfg, headers = _open_seat_page(page, base, pid)
+                    opened_here = True
+                    if in_waiting_room(page):
+                        out["waiting_room"] = True
+                        return out
                 polygons = cfg.get("polygons") or []
                 counts = {}
                 for poly in polygons:
@@ -1277,13 +1314,24 @@ def read_secutix(context, base: str, perfs: list[dict], cache: dict, resale: boo
                         seats.extend(s for s in old["seats"] if s.get("poly") == poly_id)
                         continue
                     time.sleep(random.uniform(0.5, 1.5))
+                    free_url = (f"{base}/tnwr/v1/seatmap/seats/free/polygon?productId={PARIS_PRODUCT_ID}"
+                                f"&performanceId={pid}&polygonId={urllib.parse.quote(str(poly_id))}"
+                                f"&isExclusive=false&{SECUTIX_QS}")
                     try:
-                        free = _fetch_json(page, f"{base}/tnwr/v1/seatmap/seats/free/polygon?productId={PARIS_PRODUCT_ID}"
-                                                 f"&performanceId={pid}&polygonId={urllib.parse.quote(str(poly_id))}"
-                                                 f"&isExclusive=false&{SECUTIX_QS}")
+                        free = _fetch_json(page, free_url, headers)
                     except SecutixError as exc:
-                        seat_errors.append(str(exc))
-                        continue
+                        if opened_here:
+                            seat_errors.append(str(exc))
+                            continue
+                        # Maybe the site wants this date's own seat page open first
+                        try:
+                            _, headers = _open_seat_page(page, base, pid)
+                            opened_here = True
+                            direct_ok = False
+                            free = _fetch_json(page, free_url, headers)
+                        except SecutixError as exc2:
+                            seat_errors.append(str(exc2))
+                            continue
                     seen_ids = set()
                     for feat in free.get("features") or []:
                         props = feat.get("properties") or {}
