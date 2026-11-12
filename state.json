@@ -33,56 +33,6 @@
   "wednesday 9 december 7.30pm": "https://www.rbo.org.uk/checkout/interstitial/74553"
  },
  "page_sold_out_banner": false,
- "paris": {
-  "dates_found": {
-   "resale": 2,
-   "shop": 2
-  },
-  "initialised": true,
-  "last_check_human": "Thu 12 Nov 07:34",
-  "resale": {
-   "10229732342858": 0
-  },
-  "rotation": 6,
-  "seat_checks": {
-   "10229732342858": {
-    "checked_at": "12 Nov 07:25",
-    "readable": false
-   },
-   "10229732342859": {
-    "checked_at": "12 Nov 07:34",
-    "readable": false
-   },
-   "10229732342860": {
-    "checked_at": "12 Nov 07:25",
-    "readable": false
-   },
-   "10229732342861": {
-    "checked_at": "12 Nov 07:29",
-    "readable": false
-   },
-   "10229732342862": {
-    "checked_at": "12 Nov 07:29",
-    "readable": false
-   },
-   "10229732342863": {
-    "checked_at": "12 Nov 07:34",
-    "readable": false
-   },
-   "10229732342864": {
-    "checked_at": "12 Nov 07:20",
-    "readable": false
-   },
-   "10229732342865": {
-    "checked_at": "12 Nov 07:20",
-    "readable": false
-   }
-  },
-  "status": {
-   "10229732342858": "available",
-   "10229732342865": "unknown"
-  }
- },
  "performances": {
   "friday 11 december 7.30pm": {
    "label": "Friday 11 December, 7.30pm",
