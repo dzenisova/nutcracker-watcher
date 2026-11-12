@@ -1221,7 +1221,7 @@ def _open_seat_page(page, base: str, pid: str):
     """Opens a performance's seat page and returns (config json, request headers) from the
     seat map's own request for seatmap/config/svg."""
     url = f"{base}/selection/event/seat?perfId={pid}&productId={PARIS_PRODUCT_ID}&lang=en"
-    with page.expect_response(lambda r: "/tnwr/v1/seatmap/config/svg?" in r.url, timeout=45_000) as info:
+    with page.expect_response(lambda r: "/tnwr/v1/seatmap/config/svg?" in r.url, timeout=25_000) as info:
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
     resp = info.value
     if resp.status != 200:
@@ -1230,6 +1230,8 @@ def _open_seat_page(page, base: str, pid: str):
 
 
 _SEAT_CACHE: dict = {"shop": {}, "resale": {}}   # in memory only (kept out of state.json)
+_API_BACKOFF: dict = {}                            # site -> time until which we don't ask for seat lists
+API_BACKOFF_MINUTES = 60
 
 
 def read_secutix(context, base: str, perfs: list[dict], cache: dict, resale: bool,
@@ -1262,6 +1264,8 @@ def read_secutix(context, base: str, perfs: list[dict], cache: dict, resale: boo
         if resale and out["calendar"]:
             # Only dates whose resale calendar isn't "sold out" need their seat lists
             perfs = [p for p in perfs if out["calendar"].get(p["id"]) != "sold_out"]
+        if time.time() < _API_BACKOFF.get(base, 0):
+            return out          # seat lists didn't work recently on this site; calendar only for now
 
         now = time.time()
         headers = None          # copied from the seat map's own request once we've seen one
@@ -1359,6 +1363,10 @@ def read_secutix(context, base: str, perfs: list[dict], cache: dict, resale: boo
                 entry["error"] = f"{type(exc).__name__}: {exc}"[:200]
                 out["errors"].append(entry["error"])
             out["perfs"][pid] = entry
+            if not entry.get("ok") and not any(e.get("ok") for e in out["perfs"].values()) and len(out["perfs"]) >= 2:
+                _API_BACKOFF[base] = time.time() + API_BACKOFF_MINUTES * 60
+                log(f"Seat lists not readable on {base} - using its calendar only for the next hour")
+                break
             time.sleep(random.uniform(0.5, 1.5))
         return out
     finally:
@@ -1414,6 +1422,16 @@ def paris_status_message(state: dict) -> str:
     lines.append("")
     lines.append("🟢 shows tickets · 🔴 sold out · ❔ unclear")
     return "\n".join(lines)
+
+
+def _summary_line(perf: dict, seats: set, suffix: str = "") -> str:
+    rows: dict[str, set] = {}
+    for key in seats:
+        section, row, _ = key.split("|")
+        rows.setdefault(section, set()).add(row)
+    where = "; ".join(f"{html.escape(sec)} rows {', '.join(sorted(r, key=lambda x: (0, int(x), '') if x.isdigit() else (1, 0, x)))}"
+                      for sec, r in sorted(rows.items()))
+    return f"• {html.escape(perf['label'])}{suffix}: {len(seats)} seats — {where}"
 
 
 def _new_seats(current: set, seen: dict, now: float) -> set:
@@ -1481,12 +1499,12 @@ def run_paris_check(context, state: dict, notify: bool = True) -> None:
             key_seen = {k: t for k, t in seen.items() if k.startswith(pid + "|")}
             fresh = _new_seats({f"{pid}|{k}" for k in current}, key_seen, now)
             fresh = {k.split("|", 1)[1] for k in fresh}
+            before = len(matching.get(pid) or [])
             matching[pid] = sorted(current, key=_seat_sort)
             if first_run:
                 if current:
-                    welcome_lines.append(f"<b>{html.escape(perf['label'])}</b>: {len(current)} seat(s)\n"
-                                         f"{format_paris_seats(list(current), 6)}")
-            elif fresh:
+                    welcome_lines.append(_summary_line(perf, current))
+            elif fresh and before < 2:
                 alerts_loud.append(
                     f"🎟🎟 <b>Paris — seats in your rows: {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
                     f"{format_paris_seats(list(fresh))}\n\nBook fast: {html.escape(paris_seat_url(pid))}")
@@ -1516,12 +1534,12 @@ def run_paris_check(context, state: dict, notify: bool = True) -> None:
             current = {_seat_key(s) for s in entry.get("seats", []) if seat_is_target(s, PARIS_TARGETS)}
             key_seen = {k: t for k, t in seen_resale.items() if k.startswith(pid + "|")}
             fresh = {k.split("|", 1)[1] for k in _new_seats({f"{pid}|{k}" for k in current}, key_seen, now)}
+            before = len(resale_matching.get(pid) or [])
             resale_matching[pid] = sorted(current, key=_seat_sort)
             if first_run:
                 if current:
-                    welcome_lines.append(f"<b>{html.escape(perf['label'])} — resale</b>: {len(current)} seat(s)\n"
-                                         f"{format_paris_seats(list(current), 6)}")
-            elif fresh:
+                    welcome_lines.append(_summary_line(perf, current, " (resale)"))
+            elif fresh and before < 2:
                 alerts_loud.append(
                     f"🎟🎟 <b>Paris resale — seats in your rows: {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
                     f"{format_paris_seats(list(fresh))}\n\nBook fast: {html.escape(paris_seat_url(pid, resale=True))}")
@@ -1575,8 +1593,10 @@ def _paris_welcome(ps: dict, watched: list[dict], welcome_lines: list[str]) -> s
         lines.append("Seat reading: ⚠️ not yet — I'll alert you whenever any tickets appear instead.")
     if welcome_lines:
         lines.append("\n<b>Free right now in your rows:</b>")
-        lines.extend(welcome_lines[:8])
+        lines.extend(welcome_lines[:10])
         lines.append(f"\nBook: {html.escape(paris_shop_dates_url())}")
+        lines.append("While a date already has free seats in your rows I stay quiet about it; "
+                     "I message you when a date that had (almost) none gets some.")
     elif ok.get("shop_dates"):
         lines.append("\nNothing free in your rows right now — I'll message you the moment something appears.")
     lines.append("\nSend /status any time.")
@@ -1614,6 +1634,24 @@ def main() -> int:
         state: dict = {"initialised": True, "paris": {"initialised": True}}
         with sync_playwright() as p:
             browser, context = new_browser(p)
+            for i, url in enumerate(u for u in _env("SNAPSHOT_URLS").split() if u.startswith("http")):
+                page = context.new_page()
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=20_000)
+                    except Exception:
+                        pass
+                    _accept_cookies(page)
+                    _expand_all_dates(page)
+                    page.wait_for_timeout(2000)
+                    rows = page.evaluate(EXTRACT_ROWS_JS, DATE_RE_SRC)
+                    save_snapshot(f"page_{i + 1}", page.url, page.inner_text("body"), extra={"date_rows": rows})
+                    print(f"Snapshot of {url}: {len(rows)} date rows")
+                except Exception as exc:
+                    print(f"Snapshot of {url} failed: {exc}")
+                finally:
+                    page.close()
             if LONDON_ENABLED:
                 run_check(context, state, notify=False)
             if PARIS_ENABLED:
