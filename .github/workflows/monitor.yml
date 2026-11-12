@@ -1,5 +1,8 @@
-name: Nutcracker ticket watcher
+name: Ticket watcher (London + Paris)
 
+# Each run watches for ~5.5 hours, then starts the next run itself, so watching
+# is continuous. The schedule below is only a safety net.
+# To stop everything: Actions -> Ticket watcher -> "..." -> Disable workflow.
 on:
   schedule:
     - cron: "7 */2 * * *"
@@ -11,6 +14,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   watch:
@@ -34,6 +38,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TARGET_SEATS: ${{ vars.TARGET_SEATS }}
           ONLY_DATES: ${{ vars.ONLY_DATES }}
+          LONDON_ENABLED: ${{ vars.LONDON_ENABLED }}
+          PARIS_ENABLED: ${{ vars.PARIS_ENABLED }}
+          PARIS_TARGET_SEATS: ${{ vars.PARIS_TARGET_SEATS }}
+          PARIS_ONLY_DATES: ${{ vars.PARIS_ONLY_DATES }}
           CHECK_EVERY_MINUTES: "3"
           RUN_FOR_MINUTES: "330"
         run: python monitor.py
@@ -45,10 +53,20 @@ jobs:
           git config user.name "nutcracker-watcher"
           git config user.email "nutcracker-watcher@users.noreply.github.com"
           git add state.json
+          [ -d snapshots ] && git add snapshots
           git diff --cached --quiet && exit 0
           git commit -m "Update watcher state"
-          git pull --rebase --autostash || true
-          git push
+          for attempt in 1 2 3; do
+            git pull --rebase --autostash && git push && exit 0
+            sleep 10
+          done
+          echo "Could not save state" && exit 1
+
+      - name: Start the next run
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run monitor.yml --ref "${{ github.ref_name }}" -R "${{ github.repository }}"
 
       - name: Keep page snapshots for troubleshooting
         if: always()

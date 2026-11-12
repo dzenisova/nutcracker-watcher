@@ -58,6 +58,20 @@ In the bot chat: **/status** shows every date, **/check** checks right now, **/h
 - `TARGET_SEATS` — default `Orchestra Stalls: A-G; Stalls Circle: A`.
   Example with Grand Tier too: `Orchestra Stalls: A-G; Stalls Circle: A; Grand Tier: A-B`
 
+## Paris: Hammer at the Théâtre du Châtelet
+
+The same bot also watches **Hammer** (6–14 March 2027) on the Châtelet's main
+ticket shop and on its official resale exchange, for **Orchestre rows 1–6**
+or **Corbeille row 1**. Paris alerts start with "Paris".
+
+Optional variables (same place as `ONLY_DATES`):
+- `PARIS_ONLY_DATES` — e.g. `9 March, 13 March`
+- `PARIS_TARGET_SEATS` — default `Orchestre: 1-6, A-F; Orchestra: 1-6, A-F; Parterre: 1-6, A-F; Corbeille: 1, A`
+- `LONDON_ENABLED` / `PARIS_ENABLED` — set to `0` to switch one off (e.g. London after 13 January)
+
+The bot keeps one copy of each Châtelet page it reads in the `snapshots`
+folder, so the page reader can be fixed if the site changes.
+
 ## Good to know
 
 - It checks the Nutcracker page every ~3 minutes and opens seat maps of any
