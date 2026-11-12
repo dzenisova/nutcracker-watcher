@@ -1126,112 +1126,217 @@ def paris_seat_url(perf_id: str, resale: bool = False) -> str:
     return f"{base}/selection/event/seat?perfId={perf_id}&productId={PARIS_PRODUCT_ID}&lang=en"
 
 
-# Runs inside the page: for each performance, find the block of the page that
-# belongs to it (by its id in a link/attribute, else by its date) and return its text.
-EXTRACT_PERF_BLOCKS_JS = r"""
-(perfs) => {
-  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-  const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  const mentions = (el, p) => {
-    const h = el.outerHTML;
-    if (h.includes(p.id)) return true;
-    const t = el.innerText || '';
-    return p.needles.some(n => t.includes(n));
-  };
-  const out = {};
-  const all = Array.from(document.querySelectorAll('body *'));
-  for (const p of perfs) {
-    let anchor = null, via = null;
-    for (const el of all) {
-      if (!visible(el)) continue;
-      for (const a of el.attributes) {
-        if (a.value && a.value.includes(p.id)) { anchor = el; via = 'id'; break; }
-      }
-      if (anchor) break;
-    }
-    if (!anchor) {
-      for (const el of all) {
-        if (!visible(el)) continue;
-        const t = el.innerText || '';
-        if (t.length > 200 || !p.needles.some(n => t.includes(n))) continue;
-        if (Array.from(el.children).some(c => p.needles.some(n => (c.innerText || '').includes(n)))) continue;
-        // skip headers like "from 6 March 2027 to 14 March 2027"
-        if (perfs.some(o => o.id !== p.id && o.needles.some(n => t.includes(n)))) continue;
-        anchor = el; via = 'date'; break;
-      }
-    }
-    if (!anchor) { out[p.id] = null; continue; }
-    let row = anchor;
-    while (row.parentElement && row.parentElement !== document.body) {
-      const par = row.parentElement;
-      if ((par.innerText || '').length > 900) break;
-      if (perfs.some(o => o.id !== p.id && mentions(par, o))) break;
-      row = par;
-    }
-    out[p.id] = { text: norm(row.innerText).slice(0, 700), via };
-  }
-  return out;
+# The Châtelet shop runs on SecuTix. Its seat map loads JSON from /tnwr/v1/...:
+#   seatmap/config/svg        -> every area ("polygon") with its free-seat count
+#   seatmap/seats/free/polygon -> each free seat in one area: area, row, number, category
+# The bot opens one seat page per site (to get a normal browser session), then
+# asks for that same JSON for each performance, like the seat map itself does.
+
+SECUTIX_QS = "isSeasonTicketMode=false&advantageId=&ppid=&reservationIdx=&crossSellId=&baseOperationIdsString="
+SEATS_REFRESH_MINUTES = 30      # re-read seat lists at least this often, even if counts look unchanged
+SEEN_SEAT_HOURS = 6             # a seat that was free in the last 6 hours isn't announced again
+
+FETCH_JSON_JS = r"""
+async (url) => {
+  try {
+    const r = await fetch(url, {credentials: 'include', headers: {'Accept': 'application/json'}});
+    return {status: r.status, type: r.headers.get('content-type') || '', body: await r.text()};
+  } catch (e) { return {status: 0, type: '', body: String(e)}; }
 }
 """
 
-PARIS_SOLD_RE = re.compile(
-    r"sold\s*out|[ée]puis[ée]|\bcomplet\b|no longer available|plus disponible|"
-    r"waiting\s*list|liste d.attente|\b0\s*(?:tickets?|billets?|places?)\b",
-    re.I,
-)
-PARIS_AVAILABLE_RE = re.compile(
-    r"\d+[.,]\d{2}\s*(?:eur|€)|€\s*\d+|\bbook\b|\bbuy\b|choose|select|add to|choisir|r[ée]server|acheter|"
-    r"\bavailable\b|\bdisponible|derni[eè]res places|last seats|few seats|limited",
-    re.I,
-)
-COUNT_RE = re.compile(r"\b(\d{1,4})\s*(?:tickets?|billets?|places?)\b", re.I)
-
-
-def classify_paris_shop(text: str | None) -> str | None:
-    if not text:
-        return None
-    if PARIS_SOLD_RE.search(text):
-        return "sold_out"
-    if PARIS_AVAILABLE_RE.search(text):
+def _cal_status(label: str):
+    l = label.lower()
+    if l.startswith(("available", "last", "places dispo", "derni")):
         return "available"
-    return "unknown"
-
-
-def resale_count(text: str | None):
-    """Number of resale tickets on offer: int, -1 when 'some' but unclear, None when unknown."""
-    if not text:
-        return None
-    m = COUNT_RE.search(text)
-    if m:
-        return int(m.group(1))
-    if PARIS_SOLD_RE.search(text):
-        return 0
-    if PARIS_AVAILABLE_RE.search(text):
-        return -1
+    if "sold out" in l or "complet" in l or l.startswith(("épuis", "epuis")):
+        return "sold_out"
     return None
 
 
-def read_perf_blocks(context, url: str, snapshot_name: str) -> tuple[dict, dict]:
+CAL_RE = re.compile(
+    r"(?:^|\n)[ \t]*(\d{1,2})[ \t]*\n[ \t]*(available tickets|last seats|currently sold out|sold out|inactive|"
+    r"places disponibles|derni[eè]res places|actuellement complet|complet|[ée]puis[ée]|inactif)",
+    re.I,
+)
+
+
+def _perf_day(perf: dict) -> int:
+    return int(perf["needles"][0][:2])
+
+
+def _month_label(perf: dict) -> str:
+    return perf["needles"][1].split(" ", 1)[1]          # "March 2027"
+
+
+def parse_calendar(text: str) -> dict[str, str]:
+    """Calendar on a SecuTix date page -> {perf id: 'available' | 'sold_out'}."""
+    out: dict[str, str] = {}
+    if not text:
+        return out
+    days: dict[int, str] = {}
+    for m in CAL_RE.finditer(text):
+        status = _cal_status(m.group(2))
+        if status:
+            days.setdefault(int(m.group(1)), status)
+    lowered = text.lower()
+    for perf in PARIS_PERFS:
+        month = _month_label(perf).lower()
+        month_fr = perf["needles"][2].split(" ", 1)[1].lower()
+        if month not in lowered and month_fr not in lowered:
+            continue
+        status = days.get(_perf_day(perf))
+        if status:
+            out[perf["id"]] = status
+    return out
+
+
+def _target_polygon(name: str) -> bool:
+    n = norm(name)
+    return any(t_section in n or n in t_section for t_section, _ in PARIS_TARGETS)
+
+
+class SecutixError(RuntimeError):
+    pass
+
+
+def _fetch_json(page, url: str):
+    res = page.evaluate(FETCH_JSON_JS, url)
+    if res.get("status") != 200 or "json" not in (res.get("type") or "").lower():
+        raise SecutixError(f"HTTP {res.get('status')} {(res.get('type') or '')[:30]} for {url.split('?')[0]}")
+    return json.loads(res["body"])
+
+
+_SEAT_CACHE: dict = {"shop": {}, "resale": {}}   # in memory only (kept out of state.json)
+
+
+def read_secutix(context, base: str, perfs: list[dict], cache: dict, resale: bool,
+                 snapshot_name: str) -> dict:
+    """Free seats in the target areas for each performance, via the seat-map JSON.
+
+    cache keeps, per performance, the last seat list and area counts, so seat
+    lists are only downloaded again when a count changes (or every 30 minutes).
+    Returns {"waiting_room": bool, "calendar": {...}, "perfs": {id: {...}}, "errors": [...]}.
+    """
+    out = {"waiting_room": False, "calendar": {}, "perfs": {}, "errors": []}
+    if not perfs:
+        return out
     page = context.new_page()
-    info = {"waiting_room": False}
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        # A date page first: it has the calendar (status of every date) and gives us a session.
+        page.goto(f"{base}/selection/event/date?productId={PARIS_PRODUCT_ID}&lang=en",
+                  wait_until="domcontentloaded", timeout=60_000)
         if in_waiting_room(page):
-            info["waiting_room"] = True
-            return {}, info
+            out["waiting_room"] = True
+            return out
         try:
             page.wait_for_load_state("networkidle", timeout=20_000)
         except Exception:
             pass
         _accept_cookies(page)
-        _expand_all_dates(page)
-        page.wait_for_timeout(1500)
-        blocks = page.evaluate(EXTRACT_PERF_BLOCKS_JS, PARIS_PERFS) or {}
-        save_snapshot(snapshot_name, page.url, page.inner_text("body"),
-                      extra={"blocks_found": blocks})
-        return {k: v for k, v in blocks.items() if v}, info
+        text = page.inner_text("body")
+        out["calendar"] = parse_calendar(text)
+        save_snapshot(snapshot_name, page.url, text, extra={"calendar": out["calendar"]})
+        if resale and out["calendar"]:
+            # Only dates whose resale calendar isn't "sold out" need their seat lists
+            perfs = [p for p in perfs if out["calendar"].get(p["id"]) != "sold_out"]
+
+        now = time.time()
+        for perf in perfs:
+            pid = perf["id"]
+            entry = {"ok": False}
+            try:
+                cfg = _fetch_json(page, f"{base}/tnwr/v1/seatmap/config/svg?productId={PARIS_PRODUCT_ID}"
+                                        f"&performanceId={pid}&{SECUTIX_QS}")
+                polygons = cfg.get("polygons") or []
+                counts = {}
+                for poly in polygons:
+                    counts[poly.get("id")] = {
+                        "name": str(poly.get("name") or poly.get("id")),
+                        "free": int(poly.get("availability") or 0),
+                        "resale": int(poly.get("resaleAvailability") or 0),
+                    }
+                entry.update(ok=True, counts=counts,
+                             total=sum(c["free"] for c in counts.values()),
+                             resale_total=sum(c["resale"] for c in counts.values()))
+                cal_level = next((c.get("availability") for c in cfg.get("calendarConfigurations") or []
+                                  if c.get("performanceDate") == perf["needles"][0]), None)
+                entry["level"] = cal_level
+
+                old = cache.get(pid) or {}
+                old_counts = old.get("counts") or {}
+                stale = now - float(old.get("seats_at") or 0) > SEATS_REFRESH_MINUTES * 60
+                seats, seat_errors = [], []
+                for poly_id, c in counts.items():
+                    if not _target_polygon(c["name"]):
+                        continue
+                    n = c["free"] + c["resale"]
+                    if n == 0:
+                        continue
+                    if not stale and old_counts.get(poly_id) == c and "seats" in old:
+                        seats.extend(s for s in old["seats"] if s.get("poly") == poly_id)
+                        continue
+                    time.sleep(random.uniform(0.5, 1.5))
+                    try:
+                        free = _fetch_json(page, f"{base}/tnwr/v1/seatmap/seats/free/polygon?productId={PARIS_PRODUCT_ID}"
+                                                 f"&performanceId={pid}&polygonId={urllib.parse.quote(str(poly_id))}"
+                                                 f"&isExclusive=false&{SECUTIX_QS}")
+                    except SecutixError as exc:
+                        seat_errors.append(str(exc))
+                        continue
+                    seen_ids = set()
+                    for feat in free.get("features") or []:
+                        props = feat.get("properties") or {}
+                        sid = props.get("id") or feat.get("id")
+                        if sid in seen_ids:
+                            continue
+                        seen_ids.add(sid)
+                        area = props.get("area") or {}
+                        area_name = (area.get("name") or {}).get("en") or (area.get("name") or {}).get("fr") or c["name"]
+                        seats.append({"poly": poly_id, "section": area_name,
+                                      "row": str(props.get("row") or "").strip(),
+                                      "number": str(props.get("number") or "").strip(),
+                                      "category": str(props.get("seatCategory") or ""),
+                                      "available": True})
+                if not seat_errors or seats:
+                    entry["seats_at"] = now if (stale or not old.get("seats_at")) else old.get("seats_at")
+                entry["seats"] = seats
+                entry["seat_errors"] = seat_errors
+                if seat_errors:
+                    out["errors"].extend(seat_errors[:2])
+            except SecutixError as exc:
+                entry["error"] = str(exc)
+                out["errors"].append(str(exc))
+            except Exception as exc:
+                entry["error"] = f"{type(exc).__name__}: {exc}"[:200]
+                out["errors"].append(entry["error"])
+            out["perfs"][pid] = entry
+            time.sleep(random.uniform(0.5, 1.5))
+        return out
     finally:
         page.close()
+
+
+def _seat_key(seat: dict) -> str:
+    return f"{seat['section']}|{seat['row']}|{seat['number']}"
+
+
+def _seat_sort(key: str):
+    section, row, number = key.split("|")
+    row_key = (0, int(row), "") if row.isdigit() else (1, 0, row)
+    return (section, row_key, int(re.sub(r"\D", "", number) or 0))
+
+
+def format_paris_seats(keys: list[str], limit_rows: int = 12) -> str:
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for key in sorted(keys, key=_seat_sort):
+        section, row, number = key.split("|")
+        grouped.setdefault((section, row), []).append(number)
+    lines = [f"• {html.escape(section)}, row {html.escape(row)}: {html.escape(', '.join(numbers))}"
+             for (section, row), numbers in list(grouped.items())[:limit_rows]]
+    if len(grouped) > limit_rows:
+        lines.append(f"• …and {len(grouped) - limit_rows} more rows")
+    return "\n".join(lines)
 
 
 def paris_status_message(state: dict) -> str:
@@ -1244,184 +1349,188 @@ def paris_status_message(state: dict) -> str:
     for perf in PARIS_PERFS:
         if not paris_date_watched(perf):
             continue
-        status = ps.get("status", {}).get(perf["id"]) or "unknown"
-        seat = ps.get("seat_checks", {}).get(perf["id"], {})
-        resale = ps.get("resale", {}).get(perf["id"])
-        extra = ""
-        if seat.get("readable"):
-            n = len(seat.get("matching", []))
-            extra = f" — {n} seat{'s' if n != 1 else ''} in your rows" if n else " — none in your rows"
-        if resale not in (None, 0):
-            extra += " · resale: " + ("some" if resale == -1 else str(resale))
+        pid = perf["id"]
+        status = ps.get("status", {}).get(pid) or "unknown"
+        parts = []
+        mine = ps.get("matching", {}).get(pid)
+        if mine is not None:
+            parts.append(f"{len(mine)} in your rows" if mine else "none in your rows")
+        resale_status = ps.get("resale_status", {}).get(pid)
+        resale_mine = ps.get("resale_matching", {}).get(pid)
+        if resale_mine:
+            parts.append(f"resale: {len(resale_mine)} in your rows")
+        elif resale_status == "available":
+            parts.append("resale: some")
+        extra = (" — " + " · ".join(parts)) if parts else ""
         lines.append(f"{STATUS_EMOJI.get(status, '❔')} {html.escape(perf['label'])}{extra}")
     lines.append("")
     lines.append("🟢 shows tickets · 🔴 sold out · ❔ unclear")
     return "\n".join(lines)
 
 
+def _new_seats(current: set, seen: dict, now: float) -> set:
+    cutoff = now - SEEN_SEAT_HOURS * 3600
+    return {k for k in current if float(seen.get(k, 0)) < cutoff}
+
+
+def _remember(seen: dict, current: set, now: float) -> None:
+    for k in current:
+        seen[k] = now
+    cutoff = now - SEEN_SEAT_HOURS * 3600 * 2
+    for k in [k for k, t in seen.items() if float(t) < cutoff]:
+        del seen[k]
+
+
 def run_paris_check(context, state: dict, notify: bool = True) -> None:
     ps = state.setdefault("paris", {})
     first_run = not ps.get("initialised")
-    old_status: dict = ps.setdefault("status", {})
-    old_resale: dict = ps.setdefault("resale", {})
-    seat_checks: dict = ps.setdefault("seat_checks", {})
+    status: dict = ps.setdefault("status", {})
+    resale_status: dict = ps.setdefault("resale_status", {})
+    matching: dict = ps.setdefault("matching", {})
+    resale_matching: dict = ps.setdefault("resale_matching", {})
+    seen: dict = ps.setdefault("seen", {})            # perf|seat -> last time seen free
+    seen_resale: dict = ps.setdefault("seen_resale", {})
+    cache: dict = _SEAT_CACHE["shop"]
+    resale_cache: dict = _SEAT_CACHE["resale"]
+    ps.pop("cache", None)
+    ps.pop("resale_cache", None)
+    now = time.time()
     by_id = {p["id"]: p for p in PARIS_PERFS}
+    watched = [p for p in PARIS_PERFS if paris_date_watched(p)]
 
-    shop_blocks, shop_info = read_perf_blocks(context, paris_shop_dates_url(), "paris_shop_dates")
+    shop = read_secutix(context, PARIS_SHOP, watched, cache, resale=False, snapshot_name="paris_shop_dates")
     time.sleep(random.uniform(1, 3))
-    resale_blocks, resale_info = read_perf_blocks(context, paris_resale_dates_url(), "paris_resale_dates")
-
-    if shop_info["waiting_room"] and resale_info["waiting_room"]:
+    # Resale exchange: read the calendar, and seat lists only for dates that have resale tickets
+    # (or whose resale status we don't know yet).
+    resale = read_secutix(context, PARIS_RESALE, watched, resale_cache, resale=True,
+                          snapshot_name="paris_resale_dates")
+    if shop["waiting_room"] and resale["waiting_room"]:
         _warn_once(state, "paris_waiting_room",
                    "⏳ The Châtelet ticket shop has a waiting room up right now, so I can't see "
-                   f"availability for {html.escape(PARIS_SHOW)}. I'll keep trying.", hours=2, notify=notify)
+                   f"{html.escape(PARIS_SHOW)} availability. I'll keep trying.", hours=2, notify=notify)
         return
     _clear_warning(state, "paris_waiting_room")
+    if not shop["perfs"] and not shop["calendar"] and not resale["calendar"]:
+        raise RuntimeError("Couldn't read the Châtelet pages")
 
-    new_status = {pid: classify_paris_shop((b or {}).get("text")) for pid, b in shop_blocks.items()}
-    new_resale = {pid: resale_count((b or {}).get("text")) for pid, b in resale_blocks.items()}
+    alerts_loud, alerts_quiet = [], []
+    welcome_lines = []
 
-    watched = [p["id"] for p in PARIS_PERFS if paris_date_watched(p)]
-    flipped = [pid for pid in watched
-               if old_status.get(pid) == "sold_out" and new_status.get(pid) == "available"]
-
-    # Seat maps: anything that just changed, then a rotation through the rest.
-    to_check = list(flipped)
-    if watched:
-        pointer = ps.get("rotation", 0) % len(watched)
-        added = 0
-        for pid in watched[pointer:] + watched[:pointer]:
-            if added >= PARIS_SEATMAPS_PER_CYCLE:
-                break
-            if pid not in to_check:
-                to_check.append(pid)
-                added += 1
-        ps["rotation"] = (pointer + max(added, 1)) % len(watched)
-
-    seat_results = {}
-    for pid in to_check:
-        time.sleep(random.uniform(2, 4))
-        current = new_status.get(pid) or old_status.get(pid)
-        snap = "paris_seatmap_available" if current == "available" else "paris_seatmap_soldout"
-        result = check_seat_map(context, paris_seat_url(pid), "paris_" + by_id[pid]["key"],
-                                targets=PARIS_TARGETS, open_map=True, snapshot_name=snap)
-        result["checked_at"] = dt.datetime.now(LONDON).strftime("%d %b %H:%M")
-        seat_results[pid] = result
-        log(f"Paris seat map {by_id[pid]['label']}: readable={result.get('readable')} "
-            f"available={result.get('available_count')} matching={len(result.get('matching', []))} "
-            f"sold_out_text={result.get('page_says_sold_out')} error={result.get('error')}")
-        # If the dates page didn't show this performance, use what the seat page says.
-        if new_status.get(pid) in (None, "unknown") and not result.get("error") and not result.get("waiting_room"):
-            if result.get("readable") and result.get("available_count"):
-                new_status[pid] = "available"
-            elif result.get("page_says_sold_out"):
-                new_status[pid] = "sold_out"
-            if old_status.get(pid) == "sold_out" and new_status.get(pid) == "available" and pid not in flipped:
-                flipped.append(pid)
-
-    # Alerts - shop
-    for pid in watched:
-        perf = by_id[pid]
-        result = seat_results.get(pid)
-        previous_matching = set((seat_checks.get(pid) or {}).get("matching", []))
-        link = paris_seat_url(pid)
-        readable = bool(result and result.get("readable"))
-        if readable:
-            current = set(result["matching"])
-            new_seats = current - previous_matching
-            if new_seats and not first_run and notify:
-                send(f"🎟🎟 <b>Paris — seats in your rows: {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
-                     f"{format_seats(sorted(result['matching']))}\n\nBook fast: {html.escape(link)}")
-            elif pid in flipped and not current and notify:
-                send(f"Paris: tickets appeared for {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])} "
-                     f"({result.get('available_count', 0)} seats), but none in your rows.\n{html.escape(link)}",
-                     silent=True)
-        elif pid in flipped and notify:
-            send(f"🎟 <b>Paris — tickets just appeared: {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
-                 f"I couldn't read the seat map, so check your rows quickly:\n{html.escape(link)}")
-        if result and not result.get("error") and not result.get("waiting_room"):
-            if readable:
-                seat_checks[pid] = {k: result.get(k) for k in
-                                    ("readable", "matching", "available_count", "sections", "source", "checked_at")}
-            else:
-                seat_checks[pid] = {**seat_checks.get(pid, {}), "readable": False,
-                                    "checked_at": result.get("checked_at")}
-
-    # Alerts - official resale exchange
-    for pid in watched:
-        perf = by_id[pid]
-        now, before = new_resale.get(pid), old_resale.get(pid)
-        if now in (None, 0):
-            continue
-        if before in (None, 0):
-            more = True
+    # --- main shop
+    for perf in watched:
+        pid = perf["id"]
+        entry = shop["perfs"].get(pid) or {}
+        old_status = status.get(pid)
+        if entry.get("ok"):
+            cache[pid] = {k: entry.get(k) for k in ("counts", "seats", "seats_at", "total", "level")}
+            new_status = "available" if entry.get("total") else "sold_out"
         else:
-            more = now > 0 and before > 0 and now > before
-        if first_run or not more or not notify:
-            continue
-        count_text = "some" if now == -1 else str(now)
-        resale_link = paris_resale_dates_url()
-        # Try to see which seats they are.
-        time.sleep(random.uniform(1, 3))
-        detail = check_seat_map(context, paris_seat_url(pid, resale=True), "paris_resale_" + perf["key"],
-                                targets=PARIS_TARGETS, open_map=True, snapshot_name="paris_resale_seatmap")
-        if detail.get("readable") and detail.get("available_count"):
-            if detail.get("matching"):
-                send(f"🎟🎟 <b>Paris resale — seats in your rows: {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
-                     f"{format_seats(detail['matching'])}\n\nBook fast: {html.escape(resale_link)}")
-            else:
-                send(f"Paris resale: {count_text} ticket(s) for {html.escape(perf['label'])}, "
-                     f"but none in your rows.\n{html.escape(resale_link)}", silent=True)
-        else:
-            send(f"🎟 <b>Paris resale — {count_text} ticket(s): {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
-                 f"On Châtelet's official resale exchange. Check if they're in your rows:\n{html.escape(resale_link)}")
+            new_status = shop["calendar"].get(pid) or old_status
+        if new_status:
+            status[pid] = new_status
+        if entry.get("ok") and not entry.get("seat_errors"):
+            current = {_seat_key(s) for s in entry.get("seats", []) if seat_is_target(s, PARIS_TARGETS)}
+            key_seen = {k: t for k, t in seen.items() if k.startswith(pid + "|")}
+            fresh = _new_seats({f"{pid}|{k}" for k in current}, key_seen, now)
+            fresh = {k.split("|", 1)[1] for k in fresh}
+            matching[pid] = sorted(current, key=_seat_sort)
+            if first_run:
+                if current:
+                    welcome_lines.append(f"<b>{html.escape(perf['label'])}</b>: {len(current)} seat(s)\n"
+                                         f"{format_paris_seats(list(current), 6)}")
+            elif fresh:
+                alerts_loud.append(
+                    f"🎟🎟 <b>Paris — seats in your rows: {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
+                    f"{format_paris_seats(list(fresh))}\n\nBook fast: {html.escape(paris_seat_url(pid))}")
+            _remember(seen, {f"{pid}|{k}" for k in current}, now)
+        elif not first_run and old_status == "sold_out" and new_status == "available":
+            alerts_loud.append(
+                f"🎟 <b>Paris — tickets just appeared: {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
+                f"I couldn't read the seat list, so check your rows quickly:\n{html.escape(paris_seat_url(pid))}")
 
-    # Remember what we saw (keep old values for performances not visible this time)
-    for pid, value in new_status.items():
-        if value is not None:
-            old_status[pid] = value
-    for pid, value in new_resale.items():
-        if value is not None:
-            old_resale[pid] = value
+    # --- official resale exchange
+    for perf in watched:
+        pid = perf["id"]
+        entry = resale["perfs"].get(pid) or {}
+        old = resale_status.get(pid)
+        cal = resale["calendar"].get(pid)
+        if entry.get("ok"):
+            resale_cache[pid] = {k: entry.get(k) for k in ("counts", "seats", "seats_at", "total", "level")}
+            have = (entry.get("total") or 0) + (entry.get("resale_total") or 0)
+            new = "available" if have else "sold_out"
+        else:
+            new = cal or old
+        if new:
+            resale_status[pid] = new
+        if new == "sold_out" and not entry:
+            resale_matching[pid] = []
+        if entry.get("ok") and not entry.get("seat_errors"):
+            current = {_seat_key(s) for s in entry.get("seats", []) if seat_is_target(s, PARIS_TARGETS)}
+            key_seen = {k: t for k, t in seen_resale.items() if k.startswith(pid + "|")}
+            fresh = {k.split("|", 1)[1] for k in _new_seats({f"{pid}|{k}" for k in current}, key_seen, now)}
+            resale_matching[pid] = sorted(current, key=_seat_sort)
+            if first_run:
+                if current:
+                    welcome_lines.append(f"<b>{html.escape(perf['label'])} — resale</b>: {len(current)} seat(s)\n"
+                                         f"{format_paris_seats(list(current), 6)}")
+            elif fresh:
+                alerts_loud.append(
+                    f"🎟🎟 <b>Paris resale — seats in your rows: {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
+                    f"{format_paris_seats(list(fresh))}\n\nBook fast: {html.escape(paris_seat_url(pid, resale=True))}")
+            elif old == "sold_out" and new == "available":
+                alerts_quiet.append(f"Paris resale: tickets for {html.escape(perf['label'])}, "
+                                    f"but none in your rows.\n{html.escape(paris_resale_dates_url())}")
+            _remember(seen_resale, {f"{pid}|{k}" for k in current}, now)
+        elif not first_run and old == "sold_out" and new == "available":
+            alerts_loud.append(
+                f"🎟 <b>Paris resale — tickets just appeared: {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
+                f"On Châtelet's official resale exchange. Check if they're in your rows:\n"
+                f"{html.escape(paris_resale_dates_url())}")
+
+    if notify:
+        for text in alerts_loud:
+            send(text)
+        for text in alerts_quiet:
+            send(text, silent=True)
+
     ps["last_check_human"] = dt.datetime.now(LONDON).strftime("%a %d %b %H:%M")
-    ps["dates_found"] = {"shop": len(shop_blocks), "resale": len(resale_blocks)}
+    ps["read_ok"] = {"shop_dates": sum(1 for e in shop["perfs"].values() if e.get("ok")),
+                     "resale_dates": sum(1 for e in resale["perfs"].values() if e.get("ok")),
+                     "shop_calendar": len(shop["calendar"]), "resale_calendar": len(resale["calendar"])}
+    if shop["errors"] or resale["errors"]:
+        log("Paris read problems: " + " | ".join((shop["errors"] + resale["errors"])[:4]))
+    rows_seen = {}
+    for entry in shop["perfs"].values():
+        for s in entry.get("seats", []):
+            rows_seen.setdefault(s["section"], set()).add(s["row"])
+    ps["rows_seen"] = {k: sorted(v, key=lambda r: (0, int(r), "") if r.isdigit() else (1, 0, r)) for k, v in rows_seen.items()}
 
     if first_run:
         ps["initialised"] = True
         if notify:
-            send(_paris_welcome(ps, seat_results))
+            send(_paris_welcome(ps, watched, welcome_lines))
 
 
-def _paris_welcome(ps: dict, seat_results: dict) -> str:
-    statuses = [ps.get("status", {}).get(p["id"]) for p in PARIS_PERFS]
-    found = ps.get("dates_found", {})
+def _paris_welcome(ps: dict, watched: list[dict], welcome_lines: list[str]) -> str:
+    st = [ps.get("status", {}).get(p["id"]) for p in watched]
+    rs = [ps.get("resale_status", {}).get(p["id"]) for p in watched]
+    ok = ps.get("read_ok", {})
     lines = [
         f"👋 <b>Now also watching {html.escape(PARIS_SHOW)} at the Châtelet, Paris.</b>",
-        f"{len(PARIS_PERFS)} performances: {statuses.count('sold_out')} sold out, "
-        f"{statuses.count('available')} showing tickets, "
-        f"{len(PARIS_PERFS) - statuses.count('sold_out') - statuses.count('available')} not read yet.",
-        f"Dates readable — shop: {found.get('shop', 0)}/{len(PARIS_PERFS)}, "
-        f"resale exchange: {found.get('resale', 0)}/{len(PARIS_PERFS)}.",
+        f"Main shop: {st.count('available')} of {len(watched)} dates have tickets, {st.count('sold_out')} sold out.",
+        f"Resale exchange: {rs.count('available')} dates with resale tickets.",
         f"Watching for: {html.escape(PARIS_TARGET_LABEL)}.",
     ]
-    resale_now = [(p, ps.get("resale", {}).get(p["id"])) for p in PARIS_PERFS]
-    resale_now = [(p, n) for p, n in resale_now if n not in (None, 0)]
-    if resale_now:
-        lines.append("Resale tickets on offer right now: " + ", ".join(
-            f"{html.escape(p['label'])} ({'some' if n == -1 else n})" for p, n in resale_now)
-            + f"\n{html.escape(paris_resale_dates_url())}")
-    readable = [r for r in seat_results.values() if r.get("readable")]
-    if readable:
-        sections = sorted({s for r in readable for s in r.get("sections", [])})
-        lines.append(f"Seat map reading: ✅ works (areas seen: {html.escape(', '.join(sections[:8]))}).")
-        for pid, r in seat_results.items():
-            if r.get("matching"):
-                perf = next(p for p in PARIS_PERFS if p["id"] == pid)
-                lines.append(f"\nAlready available now — {html.escape(perf['label'])}:\n"
-                             f"{format_seats(r['matching'])}\n{html.escape(paris_seat_url(pid))}")
+    if ok.get("shop_dates"):
+        lines.append(f"Seat reading: ✅ works ({ok.get('shop_dates')}/{len(watched)} dates).")
     else:
-        lines.append("Seat map reading: ⚠️ not yet — until it works I'll alert you whenever "
-                     "<i>any</i> tickets or resale tickets appear.")
+        lines.append("Seat reading: ⚠️ not yet — I'll alert you whenever any tickets appear instead.")
+    if welcome_lines:
+        lines.append("\n<b>Free right now in your rows:</b>")
+        lines.extend(welcome_lines[:8])
+        lines.append(f"\nBook: {html.escape(paris_shop_dates_url())}")
+    elif ok.get("shop_dates"):
+        lines.append("\nNothing free in your rows right now — I'll message you the moment something appears.")
     lines.append("\nSend /status any time.")
     return "\n".join(lines)
 
@@ -1466,6 +1575,14 @@ def main() -> int:
             print(re.sub(r"<[^>]+>", "", status_message(state)))
         if PARIS_ENABLED:
             print(re.sub(r"<[^>]+>", "", paris_status_message(state)))
+            ps = state.get("paris", {})
+            print("Paris read:", json.dumps(ps.get("read_ok")))
+            print("Paris rows with free seats:", json.dumps(ps.get("rows_seen"), ensure_ascii=False))
+            for perf in PARIS_PERFS:
+                for label, key in (("shop", "matching"), ("resale", "resale_matching")):
+                    seats = ps.get(key, {}).get(perf["id"])
+                    if seats:
+                        print(f"{perf['label']} {label}: " + re.sub(r"<[^>]+>", "", format_paris_seats(seats, 20)).replace("\n", " | "))
         return 0
 
     if not BOT_TOKEN or not CHAT_IDS:
