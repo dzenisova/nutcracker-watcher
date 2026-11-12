@@ -39,6 +39,10 @@ jobs:
           TARGET_SEATS: ${{ vars.TARGET_SEATS }}
           ONLY_DATES: ${{ vars.ONLY_DATES }}
           LONDON_ENABLED: ${{ vars.LONDON_ENABLED }}
+          SWAN_ENABLED: ${{ vars.SWAN_ENABLED }}
+          SWAN_CAST: ${{ vars.SWAN_CAST }}
+          SWAN_TARGET_SEATS: ${{ vars.SWAN_TARGET_SEATS }}
+          SWAN_ONLY_DATES: ${{ vars.SWAN_ONLY_DATES }}
           PARIS_ENABLED: ${{ vars.PARIS_ENABLED }}
           PARIS_TARGET_SEATS: ${{ vars.PARIS_TARGET_SEATS }}
           PARIS_ONLY_DATES: ${{ vars.PARIS_ONLY_DATES }}

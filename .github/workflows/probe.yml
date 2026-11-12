@@ -25,9 +25,10 @@ jobs:
         env:
           ONLY_DATES: ${{ vars.ONLY_DATES }}
           PARIS_ONLY_DATES: ${{ vars.PARIS_ONLY_DATES }}
+          SWAN_CAST: ${{ vars.SWAN_CAST }}
+          SWAN_ONLY_DATES: ${{ vars.SWAN_ONLY_DATES }}
           SEATMAPS_PER_CYCLE: "1"
           PARIS_SEATMAPS_PER_CYCLE: "2"
-          SNAPSHOT_URLS: "https://www.rbo.org.uk/production/swan-lake-marius-petipa"
         run: python monitor.py --once
       - name: Save page copies
         if: always()

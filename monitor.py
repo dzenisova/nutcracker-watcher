@@ -144,6 +144,41 @@ TARGETS = parse_targets(TARGETS_RAW)
 ONLY_DATES = [norm(d) for d in ONLY_DATES_RAW.split(",") if d.strip()]
 
 
+def _plain(text: str) -> str:
+    """lower case, accents removed: 'Nuñez' -> 'nunez'"""
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFKD", text or "") if not unicodedata.combining(c)).lower()
+
+
+class RBOShow:
+    """One Royal Ballet and Opera production to watch."""
+
+    def __init__(self, key, name, url, targets_raw, only_dates_raw="", cast_raw=""):
+        self.key, self.name, self.url = key, name, url
+        self.targets_raw = targets_raw
+        self.targets = parse_targets(targets_raw)
+        self.only_dates_raw = only_dates_raw
+        self.only_dates = [norm(d) for d in only_dates_raw.split(",") if d.strip()]
+        self.cast_raw = cast_raw
+        self.cast = [_plain(c.strip()) for c in cast_raw.split(",") if c.strip()]
+
+    def state(self, state: dict) -> dict:
+        # The Nutcracker keeps its state at the top level (as before); other shows get their own section.
+        return state if self.key == "london" else state.setdefault(self.key, {})
+
+    def watched(self, key: str, perf: dict | None = None) -> bool:
+        if self.only_dates and not any(
+                re.search(r"(?<!\d)" + re.escape(d) + r"(?![\w])", key) for d in self.only_dates):
+            return False
+        if self.cast:
+            text = _plain((perf or {}).get("text", ""))
+            return any(name in text for name in self.cast)
+        return True
+
+    def describe(self) -> str:
+        return describe_targets(self.targets)
+
+
 def _describe_rows(rows: list) -> str:
     if len(rows) > 2 and all(
         (int(b) - int(a) if a.isdigit() and b.isdigit() else ord(b) - ord(a)) == 1
@@ -335,8 +370,8 @@ def classify(text: str) -> str:
     return "unknown"
 
 
-def pick_link(row: dict) -> str | None:
-    production_path = urllib.parse.urlparse(PRODUCTION_URL).path.rstrip("/")
+def pick_link(row: dict, production_url: str = "") -> str | None:
+    production_path = urllib.parse.urlparse(production_url or PRODUCTION_URL).path.rstrip("/")
     links = [
         l for l in row.get("links", [])
         if l.get("href", "").startswith("http")
@@ -352,15 +387,15 @@ def pick_link(row: dict) -> str | None:
     return None
 
 
-def rows_to_performances(rows: list[dict]) -> dict[str, dict]:
+def rows_to_performances(rows: list[dict], production_url: str = "") -> dict[str, dict]:
     performances: dict[str, dict] = {}
     for row in rows:
         key = norm(row["date"])
         perf = {
             "label": re.sub(r"\s+", " ", row["date"]).strip().title().replace("Am", "am").replace("Pm", "pm"),
             "status": classify(row.get("text", "")),
-            "text": row.get("text", "")[:300],
-            "link": pick_link(row),
+            "text": row.get("text", "")[:500],
+            "link": pick_link(row, production_url),
         }
         old = performances.get(key)
         # The same date can appear twice (e.g. a calendar strip and the list);
@@ -415,11 +450,12 @@ def in_waiting_room(page) -> bool:
             or "/waitingroom" in url or "/waiting-room" in url or "/queue" in url)
 
 
-def read_production_page(context) -> tuple[dict[str, dict], dict]:
+def read_production_page(context, url: str = "") -> tuple[dict[str, dict], dict]:
+    url = url or PRODUCTION_URL
     page = context.new_page()
     info = {"waiting_room": False, "page_sold_out_banner": False}
     try:
-        page.goto(PRODUCTION_URL, wait_until="domcontentloaded", timeout=60_000)
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         if in_waiting_room(page):
             info["waiting_room"] = True
             return {}, info
@@ -435,7 +471,7 @@ def read_production_page(context) -> tuple[dict[str, dict], dict]:
         info["page_sold_out_banner"] = bool(re.search(r"all tickets are sold out", body_text, re.I))
         if not rows:
             _dump_debug("production_page", page.url, body_text[:20000], page.content()[:400000])
-        return rows_to_performances(rows), info
+        return rows_to_performances(rows, url), info
     finally:
         page.close()
 
@@ -847,23 +883,27 @@ def format_seats(matching: list[str], limit: int = 30) -> str:
     return "\n".join(lines)
 
 
-def link_for(perf: dict) -> str:
-    return perf.get("link") or PRODUCTION_URL
+def link_for(perf: dict, show=None) -> str:
+    return perf.get("link") or (show.url if show else PRODUCTION_URL)
 
 
-def status_message(state: dict) -> str:
-    perfs = state.get("performances", {})
-    seat_info = state.get("seat_checks", {})
-    last = state.get("last_check_human", "never")
-    lines = [f"<b>The Nutcracker — what I see</b> (last check {html.escape(last)})",
-             f"Watching for: {html.escape(describe_targets())}"]
-    if ONLY_DATES:
-        lines.append(f"Only these dates: {html.escape(ONLY_DATES_RAW)}")
+def status_message(state: dict, show=None) -> str:
+    show = show or NUTCRACKER
+    st = show.state(state)
+    perfs = st.get("performances", {})
+    seat_info = st.get("seat_checks", {})
+    last = st.get("last_check_human", "never")
+    lines = [f"<b>{html.escape(show.name)} — what I see</b> (last check {html.escape(last)})",
+             f"Watching for: {html.escape(show.describe())}"]
+    if show.cast:
+        lines.append(f"Only performances with: {html.escape(show.cast_raw)}")
+    if show.only_dates:
+        lines.append(f"Only these dates: {html.escape(show.only_dates_raw)}")
     lines.append("")
     if not perfs:
         lines.append("No performances read yet.")
     for key, perf in perfs.items():
-        if not date_is_watched(key):
+        if not show.watched(key, perf):
             continue
         info = seat_info.get(key, {})
         extra = ""
@@ -880,6 +920,8 @@ def help_text() -> str:
     lines = ["I watch for returned tickets and message you when seats in your rows come back:"]
     if LONDON_ENABLED:
         lines.append(f"• The Nutcracker, Royal Opera House: {html.escape(describe_targets())}")
+    if SWAN_ENABLED:
+        lines.append(f"• Swan Lake, Royal Opera House ({html.escape(SWAN.cast_raw)}): {html.escape(SWAN.describe())}")
     if PARIS_ENABLED:
         lines.append(f"• {html.escape(PARIS_SHOW)}, Théâtre du Châtelet: {html.escape(PARIS_TARGET_LABEL)}")
     lines.append("\n/status – what I see right now\n/check – check right now\n/help – this message")
@@ -890,23 +932,26 @@ def help_text() -> str:
 # One check
 # --------------------------------------------------------------------------
 
-def run_check(context, state: dict, notify: bool = True) -> None:
+def run_check(context, state: dict, notify: bool = True, show=None) -> None:
+    show = show or NUTCRACKER
+    root = state
+    state = show.state(root)
     first_run = not state.get("initialised")
     old_perfs = state.get("performances", {})
     seat_checks = state.setdefault("seat_checks", {})
     known_links = state.setdefault("links", {})
 
-    perfs, info = read_production_page(context)
+    perfs, info = read_production_page(context, show.url)
 
     if info["waiting_room"]:
-        _warn_once(state, "waiting_room",
+        _warn_once(root, "waiting_room",
                    "⏳ The Royal Opera House site has a waiting room (queue) up right now, so I can't see "
-                   f"ticket availability. I'll keep trying.\n{PRODUCTION_URL}", hours=1, notify=notify)
+                   f"ticket availability. I'll keep trying.\n{show.url}", hours=1, notify=notify)
         return
     if not perfs:
-        raise RuntimeError("Couldn't find any performance dates on the Nutcracker page")
+        raise RuntimeError(f"Couldn't find any performance dates on the {show.name} page")
 
-    _clear_warning(state, "waiting_room")
+    _clear_warning(root, "waiting_room")
 
     for key, perf in perfs.items():
         if perf.get("link"):
@@ -922,8 +967,8 @@ def run_check(context, state: dict, notify: bool = True) -> None:
             flipped.append(key)
 
     # Seat maps to open this round: changed ones first, then a rotation.
-    watched_with_links = [k for k in perfs if date_is_watched(k) and perfs[k].get("link")]
-    to_check = [k for k in flipped if date_is_watched(k) and perfs[k].get("link")]
+    watched_with_links = [k for k in perfs if show.watched(k, perfs[k]) and perfs[k].get("link")]
+    to_check = [k for k in flipped if show.watched(k, perfs[k]) and perfs[k].get("link")]
     if watched_with_links:
         pointer = state.get("rotation", 0) % len(watched_with_links)
         rotation = watched_with_links[pointer:] + watched_with_links[:pointer]
@@ -939,16 +984,18 @@ def run_check(context, state: dict, notify: bool = True) -> None:
     seat_results = {}
     for key in to_check:
         time.sleep(random.uniform(2, 5))
-        result = check_seat_map(context, perfs[key]["link"], key, snapshot_name="london_seatmap")
+        result = check_seat_map(context, perfs[key]["link"], key, targets=show.targets, open_map=True,
+                                snapshot_name=f"{show.key}_seatmap")
         result["checked_at"] = dt.datetime.now(LONDON).strftime("%d %b %H:%M")
         seat_results[key] = result
-        log(f"Seat map {perfs[key]['label']}: readable={result.get('readable')} "
+        log(f"{show.name} seat map {perfs[key]['label']}: readable={result.get('readable')} "
             f"available={result.get('available_count')} matching={len(result.get('matching', []))} "
             f"error={result.get('error')}")
 
     # Alerts
+    title = f"{show.name}, " if show.key != "london" else ""
     for key in perfs:
-        if not date_is_watched(key):
+        if not show.watched(key, perfs[key]):
             continue
         perf = perfs[key]
         result = seat_results.get(key)
@@ -961,21 +1008,21 @@ def run_check(context, state: dict, notify: bool = True) -> None:
             new_seats = current - previous_matching
             if new_seats and not first_run and notify:
                 send(
-                    f"🎟🎟 <b>Seats in your rows — {html.escape(perf['label'])}</b>\n"
+                    f"🎟🎟 <b>Seats in your rows — {html.escape(title + perf['label'])}</b>\n"
                     f"{format_seats(sorted(result['matching']))}\n\n"
-                    f"Book fast: {html.escape(link_for(perf))}"
+                    f"Book fast: {html.escape(link_for(perf, show))}"
                 )
             elif key in flipped and not current and notify:
                 send(
-                    f"Returns appeared for {html.escape(perf['label'])} "
-                    f"({result.get('available_count', 0)} seats), but none in your rows.\n{html.escape(link_for(perf))}",
+                    f"Returns appeared for {html.escape(title + perf['label'])} "
+                    f"({result.get('available_count', 0)} seats), but none in your rows.\n{html.escape(link_for(perf, show))}",
                     silent=True,
                 )
         elif key in flipped and notify:
             send(
-                f"🎟 <b>Tickets just appeared — {html.escape(perf['label'])}</b>\n"
+                f"🎟 <b>Tickets just appeared — {html.escape(title + perf['label'])}</b>\n"
                 + ("" if not contradictory else "(the seat map looked empty, so it may be a glitch)\n") +
-                f"I couldn't read the seat map, so check your rows quickly:\n{html.escape(link_for(perf))}"
+                f"I couldn't read the seat map, so check your rows quickly:\n{html.escape(link_for(perf, show))}"
             )
 
         if result and not result.get("error") and not result.get("waiting_room"):
@@ -993,30 +1040,36 @@ def run_check(context, state: dict, notify: bool = True) -> None:
     if first_run:
         state["initialised"] = True
         if notify:
-            send(_welcome_message(perfs, seat_results))
+            send(_welcome_message(perfs, seat_results, show))
 
 
-def _welcome_message(perfs: dict, seat_results: dict) -> str:
+def _welcome_message(perfs: dict, seat_results: dict, show=None) -> str:
+    show = show or NUTCRACKER
+    watched = {k: p for k, p in perfs.items() if show.watched(k, p)}
     counts: dict[str, int] = {}
-    for perf in perfs.values():
+    for perf in watched.values():
         counts[perf["status"]] = counts.get(perf["status"], 0) + 1
     readable = [r for r in seat_results.values() if r.get("readable")]
     lines = [
-        "👋 <b>Nutcracker watcher is running.</b>",
-        f"Found {len(perfs)} performances: {counts.get('sold_out', 0)} sold out, "
+        f"👋 <b>{html.escape(show.name)} watcher is running.</b>",
+        f"Watching {len(watched)} of {len(perfs)} performances: {counts.get('sold_out', 0)} sold out, "
         f"{counts.get('available', 0)} showing tickets, "
         f"{counts.get('unknown', 0) + counts.get('unavailable', 0)} unclear.",
-        f"Watching for: {html.escape(describe_targets())}.",
+        f"Watching for: {html.escape(show.describe())}.",
     ]
-    if ONLY_DATES:
-        lines.append(f"Only these dates: {html.escape(ONLY_DATES_RAW)}.")
+    if show.cast:
+        lines.append(f"Only performances with: {html.escape(show.cast_raw)}.")
+        for perf in watched.values():
+            lines.append(f"{STATUS_EMOJI.get(perf['status'], '❔')} {html.escape(perf['label'])}")
+    if show.only_dates:
+        lines.append(f"Only these dates: {html.escape(show.only_dates_raw)}.")
     if readable:
         sections = sorted({s for r in readable for s in r.get("sections", [])})
         lines.append(f"Seat map reading: ✅ works (sections seen: {html.escape(', '.join(sections[:8]))}).")
         matching_now = {k: r for k, r in seat_results.items() if r.get("matching")}
         for key, r in matching_now.items():
             lines.append(f"\nAlready available now — {html.escape(perfs[key]['label'])}:\n{format_seats(r['matching'])}\n"
-                         f"{html.escape(link_for(perfs[key]))}")
+                         f"{html.escape(link_for(perfs[key], show))}")
     elif seat_results:
         lines.append("Seat map reading: ⚠️ couldn't read seat rows yet — I'll alert you whenever "
                      "<i>any</i> tickets reappear instead.")
@@ -1049,7 +1102,13 @@ def _flag(name: str, default: str = "1") -> bool:
 
 
 LONDON_ENABLED = _flag("LONDON_ENABLED")
+SWAN_ENABLED = _flag("SWAN_ENABLED")
 PARIS_ENABLED = _flag("PARIS_ENABLED")
+NUTCRACKER = RBOShow("london", "The Nutcracker", PRODUCTION_URL, TARGETS_RAW, ONLY_DATES_RAW)
+SWAN = RBOShow("swan", "Swan Lake",
+               _env("SWAN_URL", "https://www.rbo.org.uk/production/swan-lake-marius-petipa"),
+               _env("SWAN_TARGET_SEATS", TARGETS_RAW), _env("SWAN_ONLY_DATES"),
+               _env("SWAN_CAST", "Marianela Nuñez, Francesca Hayward"))
 PARIS_SHOW = _env("PARIS_SHOW_NAME", "Hammer")
 PARIS_PRODUCT_ID = _env("PARIS_PRODUCT_ID", "10229714846846")
 PARIS_SHOP = _env("PARIS_SHOP_URL", "https://billetterie.chatelet.com").rstrip("/")
@@ -1654,11 +1713,16 @@ def main() -> int:
                     page.close()
             if LONDON_ENABLED:
                 run_check(context, state, notify=False)
+            if SWAN_ENABLED:
+                state["swan"] = {"initialised": True}
+                run_check(context, state, notify=False, show=SWAN)
             if PARIS_ENABLED:
                 run_paris_check(context, state, notify=False)
             browser.close()
         if LONDON_ENABLED:
             print(re.sub(r"<[^>]+>", "", status_message(state)))
+        if SWAN_ENABLED:
+            print(re.sub(r"<[^>]+>", "", status_message(state, SWAN)))
         if PARIS_ENABLED:
             print(re.sub(r"<[^>]+>", "", paris_status_message(state)))
             ps = state.get("paris", {})
@@ -1686,6 +1750,8 @@ def main() -> int:
     watchers = []
     if LONDON_ENABLED:
         watchers.append(("london", run_check, "the Nutcracker page (London)"))
+    if SWAN_ENABLED:
+        watchers.append(("swan", lambda ctx, st: run_check(ctx, st, show=SWAN), "the Swan Lake page (London)"))
     if PARIS_ENABLED:
         watchers.append(("paris", run_paris_check, f"the {PARIS_SHOW} pages (Paris)"))
     failures = {name: 0 for name, _, _ in watchers}
@@ -1702,7 +1768,7 @@ def main() -> int:
                 browser, context = new_browser(p)
                 checks_with_this_browser = 0
             for name, check, what in watchers:
-                initialised = state.get("initialised") if name == "london" else state.get("paris", {}).get("initialised")
+                initialised = state.get("initialised") if name == "london" else state.get(name, {}).get("initialised")
                 try:
                     check(context, state)
                     if failures[name] >= 3:
@@ -1736,6 +1802,8 @@ def main() -> int:
                     if command in ("/status", "/start"):
                         if LONDON_ENABLED:
                             send(status_message(state), chat_ids=[chat_id])
+                        if SWAN_ENABLED:
+                            send(status_message(state, SWAN), chat_ids=[chat_id])
                         if PARIS_ENABLED:
                             send(paris_status_message(state), chat_ids=[chat_id])
                     elif command == "/check":
