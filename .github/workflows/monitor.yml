@@ -1,4 +1,4 @@
-name: Ticket watcher (London + Paris)
+name: Ticket watcher (Paris - Hammer)
 
 # Each run watches for ~5.5 hours, then starts the next run itself, so watching
 # is continuous. The schedule below is only a safety net.
@@ -38,8 +38,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TARGET_SEATS: ${{ vars.TARGET_SEATS }}
           ONLY_DATES: ${{ vars.ONLY_DATES }}
-          LONDON_ENABLED: ${{ vars.LONDON_ENABLED }}
-          SWAN_ENABLED: ${{ vars.SWAN_ENABLED }}
+          LONDON_ENABLED: "0"   # Nutcracker: tickets bought
+          SWAN_ENABLED: "0"     # Swan Lake: tickets bought
           SWAN_CAST: ${{ vars.SWAN_CAST }}
           SWAN_TARGET_SEATS: ${{ vars.SWAN_TARGET_SEATS }}
           SWAN_ONLY_DATES: ${{ vars.SWAN_ONLY_DATES }}

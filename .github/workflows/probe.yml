@@ -25,6 +25,8 @@ jobs:
         env:
           ONLY_DATES: ${{ vars.ONLY_DATES }}
           PARIS_ONLY_DATES: ${{ vars.PARIS_ONLY_DATES }}
+          LONDON_ENABLED: "0"
+          SWAN_ENABLED: "0"
           SWAN_CAST: ${{ vars.SWAN_CAST }}
           SWAN_ONLY_DATES: ${{ vars.SWAN_ONLY_DATES }}
           SEATMAPS_PER_CYCLE: "1"
