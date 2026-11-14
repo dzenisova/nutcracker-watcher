@@ -1404,11 +1404,13 @@ def read_secutix(context, base: str, perfs: list[dict], cache: dict, resale: boo
                         seen_ids.add(sid)
                         area = props.get("area") or {}
                         area_name = (area.get("name") or {}).get("en") or (area.get("name") or {}).get("fr") or c["name"]
+                        coords = (feat.get("geometry") or {}).get("coordinates") or []
+                        x = coords[0] if len(coords) >= 2 and isinstance(coords[0], (int, float)) else None
                         seats.append({"poly": poly_id, "section": area_name,
                                       "row": str(props.get("row") or "").strip(),
                                       "number": str(props.get("number") or "").strip(),
                                       "category": str(props.get("seatCategory") or ""),
-                                      "available": True})
+                                      "x": x, "available": True})
                 if not seat_errors or seats:
                     entry["seats_at"] = now if (stale or not old.get("seats_at")) else old.get("seats_at")
                 entry["seats"] = seats
@@ -1728,6 +1730,21 @@ def main() -> int:
             ps = state.get("paris", {})
             print("Paris read:", json.dumps(ps.get("read_ok")))
             print("Paris rows with free seats:", json.dumps(ps.get("rows_seen"), ensure_ascii=False))
+            # Where the free seats sit across the hall (0% = one side, 100% = other side)
+            for pid, entry in _SEAT_CACHE["shop"].items():
+                seats = [x for x in (entry or {}).get("seats") or [] if x.get("x") is not None]
+                if not seats:
+                    continue
+                for area in sorted({x["section"] for x in seats}):
+                    xs = [x["x"] for x in seats if x["section"] == area]
+                    lo, hi = min(xs), max(xs)
+                    span = (hi - lo) or 1
+                    rows = {}
+                    for x in seats:
+                        if x["section"] == area and seat_is_target(x, PARIS_TARGETS):
+                            rows.setdefault(x["row"], []).append(f"{x['number']}@{round(100 * (x['x'] - lo) / span)}%/{x['category'][-1:]}")
+                    print(f"POS {pid} {area} x-range {lo:.0f}-{hi:.0f}: " + " | ".join(f"{r}: {' '.join(v)}" for r, v in sorted(rows.items())))
+                break
             for perf in PARIS_PERFS:
                 for label, key in (("shop", "matching"), ("resale", "resale_matching")):
                     seats = ps.get(key, {}).get(perf["id"])
