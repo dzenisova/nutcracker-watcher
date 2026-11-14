@@ -1126,9 +1126,13 @@ PARIS_TARGETS_RAW = _env(
     "PARIS_TARGET_SEATS",
     "Orchestre: 1-6, A-F; Orchestra: 1-6, A-F; Parterre: 1-6, A-F; Corbeille: 1, A",
 )
-PARIS_TARGET_LABEL = _env("PARIS_TARGET_LABEL", "Orchestre (stalls) first 6 rows or Corbeille front row")
+PARIS_TARGET_LABEL = _env("PARIS_TARGET_LABEL",
+                          "Orchestre (stalls) first 6 rows or Corbeille front row, categories 1–3 (full view)")
 PARIS_ONLY_DATES_RAW = _env("PARIS_ONLY_DATES")
 PARIS_SEATMAPS_PER_CYCLE = int(_env("PARIS_SEATMAPS_PER_CYCLE", "2"))
+# Only these seat categories count (Châtelet: 1-3 = full view; 4 = cheap side seats;
+# 5 = restricted view; 6 = no visibility).
+PARIS_CATEGORIES = {c.strip() for c in _env("PARIS_CATEGORIES", "1,2,3").split(",") if c.strip()}
 
 PARIS_TARGETS = parse_targets(PARIS_TARGETS_RAW)
 PARIS_ONLY_DATES = [norm(d) for d in PARIS_ONLY_DATES_RAW.split(",") if d.strip()]
@@ -1248,6 +1252,17 @@ def parse_calendar(text: str) -> dict[str, str]:
         if status:
             out[perf["id"]] = status
     return out
+
+
+def paris_seat_wanted(seat: dict) -> bool:
+    """In your rows AND a full-view category (not restricted / no visibility)."""
+    if not seat_is_target(seat, PARIS_TARGETS):
+        return False
+    cat = seat.get("category") or ""
+    if re.search(r"restrict|r[ée]duite|visibilit|no view|sans vue", cat, re.I):
+        return False
+    m = re.search(r"(\d+)", cat)
+    return not PARIS_CATEGORIES or (m is not None and m.group(1) in PARIS_CATEGORIES)
 
 
 def _target_polygon(name: str) -> bool:
@@ -1445,6 +1460,7 @@ def _seat_sort(key: str):
 
 
 def format_paris_seats(keys: list[str], limit_rows: int = 12) -> str:
+    """keys look like 'Orchestre|C|26'."""
     grouped: dict[tuple[str, str], list[str]] = {}
     for key in sorted(keys, key=_seat_sort):
         section, row, number = key.split("|")
@@ -1556,7 +1572,7 @@ def run_paris_check(context, state: dict, notify: bool = True) -> None:
         if new_status:
             status[pid] = new_status
         if entry.get("ok") and not entry.get("seat_errors"):
-            current = {_seat_key(s) for s in entry.get("seats", []) if seat_is_target(s, PARIS_TARGETS)}
+            current = {_seat_key(s) for s in entry.get("seats", []) if paris_seat_wanted(s)}
             key_seen = {k: t for k, t in seen.items() if k.startswith(pid + "|")}
             fresh = _new_seats({f"{pid}|{k}" for k in current}, key_seen, now)
             fresh = {k.split("|", 1)[1] for k in fresh}
@@ -1565,7 +1581,7 @@ def run_paris_check(context, state: dict, notify: bool = True) -> None:
             if first_run:
                 if current:
                     welcome_lines.append(_summary_line(perf, current))
-            elif fresh and before < 2:
+            elif fresh:
                 alerts_loud.append(
                     f"🎟🎟 <b>Paris — seats in your rows: {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
                     f"{format_paris_seats(list(fresh))}\n\nBook fast: {html.escape(paris_seat_url(pid))}")
@@ -1592,7 +1608,7 @@ def run_paris_check(context, state: dict, notify: bool = True) -> None:
         if new == "sold_out" and not entry:
             resale_matching[pid] = []
         if entry.get("ok") and not entry.get("seat_errors"):
-            current = {_seat_key(s) for s in entry.get("seats", []) if seat_is_target(s, PARIS_TARGETS)}
+            current = {_seat_key(s) for s in entry.get("seats", []) if paris_seat_wanted(s)}
             key_seen = {k: t for k, t in seen_resale.items() if k.startswith(pid + "|")}
             fresh = {k.split("|", 1)[1] for k in _new_seats({f"{pid}|{k}" for k in current}, key_seen, now)}
             before = len(resale_matching.get(pid) or [])
@@ -1600,7 +1616,7 @@ def run_paris_check(context, state: dict, notify: bool = True) -> None:
             if first_run:
                 if current:
                     welcome_lines.append(_summary_line(perf, current, " (resale)"))
-            elif fresh and before < 2:
+            elif fresh:
                 alerts_loud.append(
                     f"🎟🎟 <b>Paris resale — seats in your rows: {html.escape(PARIS_SHOW)}, {html.escape(perf['label'])}</b>\n"
                     f"{format_paris_seats(list(fresh))}\n\nBook fast: {html.escape(paris_seat_url(pid, resale=True))}")
@@ -1656,8 +1672,7 @@ def _paris_welcome(ps: dict, watched: list[dict], welcome_lines: list[str]) -> s
         lines.append("\n<b>Free right now in your rows:</b>")
         lines.extend(welcome_lines[:10])
         lines.append(f"\nBook: {html.escape(paris_shop_dates_url())}")
-        lines.append("While a date already has free seats in your rows I stay quiet about it; "
-                     "I message you when a date that had (almost) none gets some.")
+        lines.append("I'll message you whenever another seat like these comes free.")
     elif ok.get("shop_dates"):
         lines.append("\nNothing free in your rows right now — I'll message you the moment something appears.")
     lines.append("\nSend /status any time.")
